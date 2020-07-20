@@ -84,10 +84,11 @@ public class CachedBTreePartition extends ImmutableBTreePartition implements Cac
 
         int cachedLiveRows = 0;
         int rowsWithNonExpiringCells = 0;
+        boolean enforceStrictLiveness = iterator.metadata().enforceStrictLiveness();
 
         for (Row row : BTree.<Row>iterable(holder.tree))
         {
-            if (row.hasLiveData(nowInSec))
+            if (row.hasLiveData(nowInSec, enforceStrictLiveness))
                 ++cachedLiveRows;
 
             boolean hasNonExpiringLiveCell = false;
@@ -176,11 +177,11 @@ public class CachedBTreePartition extends ImmutableBTreePartition implements Cac
 
 
             TableMetadata metadata = Schema.instance.getExistingTableMetadata(TableId.deserialize(in));
-            UnfilteredRowIteratorSerializer.Header header = UnfilteredRowIteratorSerializer.serializer.deserializeHeader(metadata, null, in, version, SerializationHelper.Flag.LOCAL);
+            UnfilteredRowIteratorSerializer.Header header = UnfilteredRowIteratorSerializer.serializer.deserializeHeader(metadata, null, in, version, DeserializationHelper.Flag.LOCAL);
             assert !header.isReversed && header.rowEstimate >= 0;
 
             Holder holder;
-            try (UnfilteredRowIterator partition = UnfilteredRowIteratorSerializer.serializer.deserialize(in, version, metadata, SerializationHelper.Flag.LOCAL, header))
+            try (UnfilteredRowIterator partition = UnfilteredRowIteratorSerializer.serializer.deserialize(in, version, metadata, DeserializationHelper.Flag.LOCAL, header))
             {
                 holder = ImmutableBTreePartition.build(partition, header.rowEstimate);
             }

@@ -19,6 +19,7 @@
 package org.apache.cassandra.db;
 
 import java.io.File;
+import java.io.FileReader;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
@@ -29,6 +30,10 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
+import org.json.simple.JSONArray;
+import org.json.simple.JSONObject;
+import org.json.simple.parser.JSONParser;
+
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -38,7 +43,6 @@ import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.partitions.*;
-import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
@@ -49,9 +53,9 @@ import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.WrappedRunnable;
 import static junit.framework.Assert.assertNotNull;
+
 @RunWith(OrderedJUnit4ClassRunner.class)
 public class ColumnFamilyStoreTest
 {
@@ -170,7 +174,9 @@ public class ColumnFamilyStoreTest
         ByteBuffer val = ByteBufferUtil.bytes("val1");
 
         // insert
-        ColumnMetadata newCol = ColumnMetadata.regularColumn(cfs.metadata(), ByteBufferUtil.bytes("val2"), AsciiType.instance);
+        Mutation.SimpleBuilder builder = Mutation.simpleBuilder(keyspaceName, cfs.metadata().partitioner.decorateKey(ByteBufferUtil.bytes("val2")));
+        builder.update(cfName).row("Column1").add("val", "val1").build();
+
         new RowUpdateBuilder(cfs.metadata(), 0, "key1").clustering("Column1").add("val", "val1").build().applyUnsafe();
         new RowUpdateBuilder(cfs.metadata(), 0, "key2").clustering("Column1").add("val", "val1").build().applyUnsafe();
         assertRangeCount(cfs, col, val, 2);
@@ -238,7 +244,7 @@ public class ColumnFamilyStoreTest
         cfs.snapshot("nonEphemeralSnapshot", null, false, false);
         cfs.snapshot("ephemeralSnapshot", null, true, false);
 
-        Map<String, Pair<Long, Long>> snapshotDetails = cfs.getSnapshotDetails();
+        Map<String, Directories.SnapshotSizeDetails> snapshotDetails = cfs.getSnapshotDetails();
         assertEquals(2, snapshotDetails.size());
         assertTrue(snapshotDetails.containsKey("ephemeralSnapshot"));
         assertTrue(snapshotDetails.containsKey("nonEphemeralSnapshot"));
@@ -424,6 +430,39 @@ public class ColumnFamilyStoreTest
             }
         }
         assertEquals(count, found);
+    }
+
+    @Test
+    public void testSnapshotWithoutFlushWithSecondaryIndexes() throws Exception
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_INDEX1);
+        cfs.truncateBlocking();
+
+        UpdateBuilder builder = UpdateBuilder.create(cfs.metadata.get(), "key")
+                                             .newRow()
+                                             .add("birthdate", 1L)
+                                             .add("notbirthdate", 2L);
+        new Mutation(builder.build()).applyUnsafe();
+        cfs.forceBlockingFlush();
+
+        String snapshotName = "newSnapshot";
+        cfs.snapshotWithoutFlush(snapshotName);
+
+        File snapshotManifestFile = cfs.getDirectories().getSnapshotManifestFile(snapshotName);
+        JSONParser parser = new JSONParser();
+        JSONObject manifest = (JSONObject) parser.parse(new FileReader(snapshotManifestFile));
+        JSONArray files = (JSONArray) manifest.get("files");
+
+        // Keyspace1-Indexed1 and the corresponding index
+        assert files.size() == 2;
+
+        // Snapshot of the secondary index is stored in the subfolder with the same file name
+        String baseTableFile = (String) files.get(0);
+        String indexTableFile = (String) files.get(1);
+        assert !baseTableFile.equals(indexTableFile);
+        assert Directories.isSecondaryIndexFolder(new File(indexTableFile).getParentFile());
+        assert indexTableFile.endsWith(baseTableFile);
     }
 
     @Test

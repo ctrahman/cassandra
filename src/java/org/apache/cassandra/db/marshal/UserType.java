@@ -22,30 +22,29 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 import com.google.common.base.Objects;
+import com.google.common.collect.Lists;
 
 import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.CellPath;
-import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.exceptions.SyntaxException;
+import org.apache.cassandra.schema.Difference;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.UserTypeSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+
+import static com.google.common.collect.Iterables.any;
+import static com.google.common.collect.Iterables.transform;
 
 /**
  * A user defined type.
  *
  * A user type is really just a tuple type on steroids.
  */
-public class UserType extends TupleType
+public class UserType extends TupleType implements SchemaElement
 {
-    private static final Logger logger = LoggerFactory.getLogger(UserType.class);
-
     public final String keyspace;
     public final ByteBuffer name;
     private final List<FieldIdentifier> fieldNames;
@@ -73,7 +72,7 @@ public class UserType extends TupleType
         this.serializer = new UserTypeSerializer(fieldSerializers);
     }
 
-    public static UserType getInstance(TypeParser parser) throws ConfigurationException, SyntaxException
+    public static UserType getInstance(TypeParser parser)
     {
         Pair<Pair<String, ByteBuffer>, List<Pair<ByteBuffer, AbstractType>>> params = parser.getUserTypeParameters();
         String keyspace = params.left.left;
@@ -333,34 +332,44 @@ public class UserType extends TupleType
     @Override
     public boolean equals(Object o)
     {
-        return o instanceof UserType && equals(o, false);
-    }
-
-    @Override
-    public boolean equals(Object o, boolean ignoreFreezing)
-    {
         if(!(o instanceof UserType))
             return false;
 
         UserType that = (UserType)o;
 
-        if (!keyspace.equals(that.keyspace) || !name.equals(that.name) || !fieldNames.equals(that.fieldNames))
-            return false;
+        return equalsWithoutTypes(that) && types.equals(that.types);
+    }
 
-        if (!ignoreFreezing && isMultiCell != that.isMultiCell)
-            return false;
+    private boolean equalsWithoutTypes(UserType other)
+    {
+        return name.equals(other.name)
+            && fieldNames.equals(other.fieldNames)
+            && keyspace.equals(other.keyspace)
+            && isMultiCell == other.isMultiCell;
+    }
 
-        if (this.types.size() != that.types.size())
-            return false;
+    public Optional<Difference> compare(UserType other)
+    {
+        if (!equalsWithoutTypes(other))
+            return Optional.of(Difference.SHALLOW);
 
-        Iterator<AbstractType<?>> otherTypeIter = that.types.iterator();
-        for (AbstractType<?> type : types)
+        boolean differsDeeply = false;
+
+        for (int i = 0; i < fieldTypes().size(); i++)
         {
-            if (!type.equals(otherTypeIter.next(), ignoreFreezing))
-                return false;
+            AbstractType<?> thisType = fieldType(i);
+            AbstractType<?> thatType = other.fieldType(i);
+
+            if (!thisType.equals(thatType))
+            {
+                if (thisType.asCQL3Type().toString().equals(thatType.asCQL3Type().toString()))
+                    differsDeeply = true;
+                else
+                    return Optional.of(Difference.SHALLOW);
+            }
         }
 
-        return true;
+        return differsDeeply ? Optional.of(Difference.DEEP) : Optional.empty();
     }
 
     @Override
@@ -370,10 +379,30 @@ public class UserType extends TupleType
     }
 
     @Override
-    public boolean referencesUserType(String userTypeName)
+    public boolean referencesUserType(ByteBuffer name)
     {
-        return getNameAsString().equals(userTypeName) ||
-               fieldTypes().stream().anyMatch(f -> f.referencesUserType(userTypeName));
+        return this.name.equals(name) || any(fieldTypes(), t -> t.referencesUserType(name));
+    }
+
+    @Override
+    public UserType withUpdatedUserType(UserType udt)
+    {
+        if (!referencesUserType(udt.name))
+            return this;
+
+        // preserve frozen/non-frozen status of the updated UDT
+        if (name.equals(udt.name))
+        {
+            return isMultiCell == udt.isMultiCell
+                 ? udt
+                 : new UserType(keyspace, name, udt.fieldNames(), udt.fieldTypes(), isMultiCell);
+        }
+
+        return new UserType(keyspace,
+                            name,
+                            fieldNames,
+                            Lists.newArrayList(transform(fieldTypes(), t -> t.withUpdatedUserType(udt))),
+                            isMultiCell());
     }
 
     @Override
@@ -403,7 +432,7 @@ public class UserType extends TupleType
         return sb.toString();
     }
 
-    public String toCQLString()
+    public String getCqlTypeName()
     {
         return String.format("%s.%s", ColumnIdentifier.maybeQuote(keyspace), ColumnIdentifier.maybeQuote(getNameAsString()));
     }
@@ -412,5 +441,53 @@ public class UserType extends TupleType
     public TypeSerializer<ByteBuffer> getSerializer()
     {
         return serializer;
+    }
+
+    @Override
+    public SchemaElementType elementType()
+    {
+        return SchemaElementType.TYPE;
+    }
+
+    @Override
+    public String elementKeyspace()
+    {
+        return keyspace;
+    }
+
+    @Override
+    public String elementName()
+    {
+        return getNameAsString();
+    }
+
+    @Override
+    public String toCqlString(boolean withInternals)
+    {
+        CqlBuilder builder = new CqlBuilder();
+        builder.append("CREATE TYPE ")
+               .appendQuotingIfNeeded(keyspace)
+               .append('.')
+               .appendQuotingIfNeeded(getNameAsString())
+               .append(" (")
+               .newLine()
+               .increaseIndent();
+
+        for (int i = 0; i < size(); i++)
+        {
+            if (i > 0)
+                builder.append(",")
+                       .newLine();
+
+            builder.append(fieldNameAsString(i))
+                   .append(' ')
+                   .append(fieldType(i));
+        }
+
+        builder.newLine()
+               .decreaseIndent()
+               .append(");");
+
+        return builder.toString();
     }
 }

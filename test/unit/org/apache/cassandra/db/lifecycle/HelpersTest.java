@@ -30,15 +30,17 @@ import com.google.common.collect.Lists;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import junit.framework.Assert;
+import org.junit.Assert;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.MockSchema;
 
 import static junit.framework.Assert.assertEquals;
 import static junit.framework.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 
 public class HelpersTest
 {
@@ -47,6 +49,7 @@ public class HelpersTest
     public static void setUp()
     {
         DatabaseDescriptor.daemonInitialization();
+        CommitLog.instance.start();
         MockSchema.cleanup();
     }
 
@@ -163,9 +166,10 @@ public class HelpersTest
         ColumnFamilyStore cfs = MockSchema.newCFS();
         LogTransaction txnLogs = new LogTransaction(OperationType.UNKNOWN);
         Iterable<SSTableReader> readers = Lists.newArrayList(MockSchema.sstable(1, cfs), MockSchema.sstable(2, cfs));
+        Iterable<SSTableReader> readersToKeep = Lists.newArrayList(MockSchema.sstable(3, cfs), MockSchema.sstable(4, cfs));
 
         List<LogTransaction.Obsoletion> obsoletions = new ArrayList<>();
-        Assert.assertNull(Helpers.prepareForObsoletion(readers, txnLogs, obsoletions, null));
+        Helpers.prepareForObsoletion(readers, txnLogs, obsoletions, null);
         assertNotNull(obsoletions);
         assertEquals(2, obsoletions.size());
 
@@ -174,9 +178,31 @@ public class HelpersTest
         for (SSTableReader reader : readers)
             Assert.assertTrue(reader.isMarkedCompacted());
 
+        for (SSTableReader reader : readersToKeep)
+            Assert.assertFalse(reader.isMarkedCompacted());
+
         accumulate = Helpers.markObsolete(obsoletions, null);
         assertNotNull(accumulate);
 
         txnLogs.finish();
+    }
+
+    @Test
+    public void testObsoletionPerformance()
+    {
+        ColumnFamilyStore cfs = MockSchema.newCFS();
+        LogTransaction txnLogs = new LogTransaction(OperationType.UNKNOWN);
+        List<SSTableReader> readers = new ArrayList<>();
+
+        for (int i = 0; i < 10000; i++)
+        {
+            readers.add(MockSchema.sstable(i + 1, cfs));
+        }
+        long start = System.currentTimeMillis();
+
+        Helpers.prepareForObsoletion(readers.subList(0, 500), txnLogs, new ArrayList<>(),null );
+        txnLogs.finish();
+        long time = System.currentTimeMillis() - start;
+        assertTrue(time < 20000);
     }
 }

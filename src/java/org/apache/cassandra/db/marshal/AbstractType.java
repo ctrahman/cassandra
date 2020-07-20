@@ -20,12 +20,7 @@ package org.apache.cassandra.db.marshal;
 import java.io.IOException;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,15 +31,14 @@ import org.apache.cassandra.cql3.ColumnSpecification;
 import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.exceptions.SyntaxException;
-import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.serializers.MarshalException;
-
+import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FastByteOperations;
 import org.github.jamm.Unmetered;
-import org.apache.cassandra.io.util.DataOutputPlus;
-import org.apache.cassandra.io.util.DataInputPlus;
-import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.apache.cassandra.db.marshal.AbstractType.ComparisonType.CUSTOM;
 
@@ -348,6 +342,11 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
         return this;
     }
 
+    public List<AbstractType<?>> subTypes()
+    {
+        return Collections.emptyList();
+    }
+
     /**
      * Returns an AbstractType instance that is equivalent to this one, but with all nested UDTs and collections
      * explicitly frozen.
@@ -456,9 +455,29 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
             ByteBufferUtil.skipWithVIntLength(in);
     }
 
-    public boolean referencesUserType(String userTypeName)
+    public boolean referencesUserType(ByteBuffer name)
     {
         return false;
+    }
+
+    /**
+     * Returns an instance of this type with all references to the provided user type recursively replaced with its new
+     * definition.
+     */
+    public AbstractType<?> withUpdatedUserType(UserType udt)
+    {
+        return this;
+    }
+
+    /**
+     * Replace any instances of UserType with equivalent TupleType-s.
+     *
+     * We need it for dropped_columns, to allow safely dropping unused user types later without retaining any references
+     * to them in system_schema.dropped_columns.
+     */
+    public AbstractType<?> expandUserTypes()
+    {
+        return this;
     }
 
     public boolean referencesDuration()
@@ -468,9 +487,6 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
 
     /**
      * Tests whether a CQL value having this type can be assigned to the provided receiver.
-     *
-     * @param keyspace the keyspace from which the receiver is.
-     * @param receiver the receiver for which we want to test type compatibility with.
      */
     public AssignmentTestable.TestResult testAssignment(AbstractType<?> receiverType)
     {
@@ -503,17 +519,6 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
     public String toString()
     {
         return getClass().getName();
-    }
-
-    /**
-     * Checks to see if two types are equal when ignoring or not ignoring differences in being frozen, depending on
-     * the value of the ignoreFreezing parameter.
-     * @param other type to compare
-     * @param ignoreFreezing if true, differences in the types being frozen will be ignored
-     */
-    public boolean equals(Object other, boolean ignoreFreezing)
-    {
-        return this.equals(other);
     }
 
     public void checkComparable()

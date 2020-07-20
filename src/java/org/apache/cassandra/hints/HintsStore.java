@@ -19,18 +19,19 @@ package org.apache.cassandra.hints;
 
 import java.io.File;
 import java.io.IOException;
-import java.net.InetAddress;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.gms.FailureDetector;
 import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.SyncUtil;
 
@@ -51,7 +52,7 @@ final class HintsStore
 
     private final Map<HintsDescriptor, InputPosition> dispatchPositions;
     private final Deque<HintsDescriptor> dispatchDequeue;
-    private final Queue<HintsDescriptor> blacklistedFiles;
+    private final Queue<HintsDescriptor> corruptedFiles;
 
     // last timestamp used in a descriptor; make sure to not reuse the same timestamp for new descriptors.
     private volatile long lastUsedTimestamp;
@@ -65,7 +66,7 @@ final class HintsStore
 
         dispatchPositions = new ConcurrentHashMap<>();
         dispatchDequeue = new ConcurrentLinkedDeque<>(descriptors);
-        blacklistedFiles = new ConcurrentLinkedQueue<>();
+        corruptedFiles = new ConcurrentLinkedQueue<>();
 
         //noinspection resource
         lastUsedTimestamp = descriptors.stream().mapToLong(d -> d.timestamp).max().orElse(0L);
@@ -77,14 +78,20 @@ final class HintsStore
         return new HintsStore(hostId, hintsDirectory, writerParams, descriptors);
     }
 
-    InetAddress address()
+    @VisibleForTesting
+    int getDispatchQueueSize()
+    {
+        return dispatchDequeue.size();
+    }
+
+    InetAddressAndPort address()
     {
         return StorageService.instance.getEndpointForHostId(hostId);
     }
 
     boolean isLive()
     {
-        InetAddress address = address();
+        InetAddressAndPort address = address();
         return address != null && FailureDetector.instance.isAlive(address);
     }
 
@@ -112,7 +119,7 @@ final class HintsStore
             delete(descriptor);
         }
 
-        while ((descriptor = blacklistedFiles.poll()) != null)
+        while ((descriptor = corruptedFiles.poll()) != null)
         {
             cleanUp(descriptor);
             delete(descriptor);
@@ -151,9 +158,9 @@ final class HintsStore
         dispatchPositions.remove(descriptor);
     }
 
-    void blacklist(HintsDescriptor descriptor)
+    void markCorrupted(HintsDescriptor descriptor)
     {
-        blacklistedFiles.add(descriptor);
+        corruptedFiles.add(descriptor);
     }
 
     /*

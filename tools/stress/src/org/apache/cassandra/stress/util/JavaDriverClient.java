@@ -50,7 +50,7 @@ public class JavaDriverClient
     public final int connectionsPerHost;
 
     private final ProtocolVersion protocolVersion;
-    private final EncryptionOptions.ClientEncryptionOptions encryptionOptions;
+    private final EncryptionOptions encryptionOptions;
     private Cluster cluster;
     private Session session;
     private final LoadBalancingPolicy loadBalancingPolicy;
@@ -59,10 +59,10 @@ public class JavaDriverClient
 
     public JavaDriverClient(StressSettings settings, String host, int port)
     {
-        this(settings, host, port, new EncryptionOptions.ClientEncryptionOptions());
+        this(settings, host, port, new EncryptionOptions());
     }
 
-    public JavaDriverClient(StressSettings settings, String host, int port, EncryptionOptions.ClientEncryptionOptions encryptionOptions)
+    public JavaDriverClient(StressSettings settings, String host, int port, EncryptionOptions encryptionOptions)
     {
         this.protocolVersion = settings.mode.protocolVersion;
         this.host = host;
@@ -134,16 +134,17 @@ public class JavaDriverClient
                                                 .withoutJMXReporting()
                                                 .withProtocolVersion(protocolVersion)
                                                 .withoutMetrics(); // The driver uses metrics 3 with conflict with our version
+
         if (loadBalancingPolicy != null)
             clusterBuilder.withLoadBalancingPolicy(loadBalancingPolicy);
         clusterBuilder.withCompression(compression);
-        if (encryptionOptions.enabled)
+        if (encryptionOptions.isEnabled())
         {
             SSLContext sslContext;
             sslContext = SSLFactory.createSSLContext(encryptionOptions, true);
             SSLOptions sslOptions = JdkSSLOptions.builder()
                                                  .withSSLContext(sslContext)
-                                                 .withCipherSuites(encryptionOptions.cipher_suites).build();
+                                                 .withCipherSuites(encryptionOptions.cipher_suites.toArray(new String[0])).build();
             clusterBuilder.withSSL(sslOptions);
         }
 
@@ -166,7 +167,7 @@ public class JavaDriverClient
         for (Host host : metadata.getAllHosts())
         {
             System.out.printf("Datacenter: %s; Host: %s; Rack: %s%n",
-                    host.getDatacenter(), host.getAddress(), host.getRack());
+                    host.getDatacenter(), host.getAddress() + ":" + host.getSocketAddress().getPort(), host.getRack());
         }
 
         session = cluster.connect();
@@ -185,13 +186,24 @@ public class JavaDriverClient
     public ResultSet execute(String query, org.apache.cassandra.db.ConsistencyLevel consistency)
     {
         SimpleStatement stmt = new SimpleStatement(query);
-        stmt.setConsistencyLevel(from(consistency));
+
+        if (consistency.isSerialConsistency())
+            stmt.setSerialConsistencyLevel(from(consistency));
+        else
+            stmt.setConsistencyLevel(from(consistency));
         return getSession().execute(stmt);
     }
 
     public ResultSet executePrepared(PreparedStatement stmt, List<Object> queryParams, org.apache.cassandra.db.ConsistencyLevel consistency)
     {
-        stmt.setConsistencyLevel(from(consistency));
+        if (consistency.isSerialConsistency())
+        {
+            stmt.setSerialConsistencyLevel(from(consistency));
+        }
+        else
+        {
+            stmt.setConsistencyLevel(from(consistency));
+        }
         BoundStatement bstmt = stmt.bind((Object[]) queryParams.toArray(new Object[queryParams.size()]));
         return getSession().execute(bstmt);
     }
@@ -225,6 +237,10 @@ public class JavaDriverClient
                 return com.datastax.driver.core.ConsistencyLevel.EACH_QUORUM;
             case LOCAL_ONE:
                 return com.datastax.driver.core.ConsistencyLevel.LOCAL_ONE;
+            case SERIAL:
+                return com.datastax.driver.core.ConsistencyLevel.SERIAL;
+            case LOCAL_SERIAL:
+                return com.datastax.driver.core.ConsistencyLevel.LOCAL_SERIAL;
         }
         throw new AssertionError();
     }

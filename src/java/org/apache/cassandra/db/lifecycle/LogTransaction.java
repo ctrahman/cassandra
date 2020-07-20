@@ -30,21 +30,24 @@ import java.util.function.Predicate;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.Runnables;
+import org.apache.cassandra.service.StorageService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.schema.TableMetadata;
-import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.lifecycle.LogRecord.Type;
+import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.io.sstable.SnapshotDeletingTask;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.tools.StandaloneSSTableUtil;
 import org.apache.cassandra.utils.*;
 import org.apache.cassandra.utils.concurrent.Ref;
 import org.apache.cassandra.utils.concurrent.RefCounted;
@@ -133,7 +136,7 @@ class LogTransaction extends Transactional.AbstractTransactional implements Tran
      **/
     void trackNew(SSTable table)
     {
-        txnFile.add(Type.ADD, table);
+        txnFile.add(table);
     }
 
     /**
@@ -141,29 +144,44 @@ class LogTransaction extends Transactional.AbstractTransactional implements Tran
      */
     void untrackNew(SSTable table)
     {
-        txnFile.remove(Type.ADD, table);
+        txnFile.remove(table);
+    }
+
+    /**
+     * helper method for tests, creates the remove records per sstable
+     */
+    @VisibleForTesting
+    SSTableTidier obsoleted(SSTableReader sstable)
+    {
+        return obsoleted(sstable, LogRecord.make(Type.REMOVE, sstable));
     }
 
     /**
      * Schedule a reader for deletion as soon as it is fully unreferenced.
      */
-    SSTableTidier obsoleted(SSTableReader reader)
+    SSTableTidier obsoleted(SSTableReader reader, LogRecord logRecord)
     {
-        if (txnFile.contains(Type.ADD, reader))
+        if (txnFile.contains(Type.ADD, reader, logRecord))
         {
-            if (txnFile.contains(Type.REMOVE, reader))
+            if (txnFile.contains(Type.REMOVE, reader, logRecord))
                 throw new IllegalArgumentException();
 
             return new SSTableTidier(reader, true, this);
         }
 
-        txnFile.add(Type.REMOVE, reader);
+        txnFile.addRecord(logRecord);
 
         if (tracker != null)
             tracker.notifyDeleting(reader);
 
         return new SSTableTidier(reader, false, this);
     }
+
+    Map<SSTable, LogRecord> makeRemoveRecords(Iterable<SSTableReader> sstables)
+    {
+        return txnFile.makeRecords(Type.REMOVE, sstables);
+    }
+
 
     OperationType type()
     {
@@ -197,7 +215,9 @@ class LogTransaction extends Transactional.AbstractTransactional implements Tran
     {
         try
         {
-            if (logger.isTraceEnabled())
+            if (!StorageService.instance.isDaemonSetupCompleted())
+                logger.info("Unfinished transaction log, deleting {} ", file);
+            else if (logger.isTraceEnabled())
                 logger.trace("Deleting {}", file);
 
             Files.delete(file.toPath());
@@ -212,13 +232,13 @@ class LogTransaction extends Transactional.AbstractTransactional implements Tran
                 {
                     e.printStackTrace(ps);
                 }
-                logger.debug("Unable to delete {} as it does not exist, stack trace:\n {}", file, baos.toString());
+                logger.debug("Unable to delete {} as it does not exist, stack trace:\n {}", file, baos);
             }
         }
         catch (IOException e)
         {
             logger.error("Unable to delete {}", file, e);
-            throw new RuntimeException(e);
+            FileUtils.handleFSErrorAndPropagate(new FSWriteError(e, file));
         }
     }
 
@@ -252,8 +272,10 @@ class LogTransaction extends Transactional.AbstractTransactional implements Tran
             if (logger.isTraceEnabled())
                 logger.trace("Removing files for transaction log {}", data);
 
+            // this happens if we forget to close a txn and the garbage collector closes it for us
+            // or if the transaction journal was never properly created in the first place
             if (!data.completed())
-            { // this happens if we forget to close a txn and the garbage collector closes it for us
+            {
                 logger.error("Transaction log {} indicates txn was not completed, trying to abort it now", data);
                 Throwable err = Throwables.perform((Throwable)null, data::abort);
                 if (err != null)
@@ -405,14 +427,14 @@ class LogTransaction extends Transactional.AbstractTransactional implements Tran
      * for further details on transaction logs.
      *
      * This method is called on startup and by the standalone sstableutil tool when the cleanup option is specified,
-     * @see StandaloneSSTableUtil.
+     * @see org.apache.cassandra.tools.StandaloneSSTableUtil
      *
      * @return true if the leftovers of all transaction logs found were removed, false otherwise.
      *
      */
     static boolean removeUnfinishedLeftovers(TableMetadata metadata)
     {
-        return removeUnfinishedLeftovers(new Directories(metadata, ColumnFamilyStore.getInitialDirectories()).getCFDirectories());
+        return removeUnfinishedLeftovers(new Directories(metadata).getCFDirectories());
     }
 
     @VisibleForTesting
@@ -460,6 +482,7 @@ class LogTransaction extends Transactional.AbstractTransactional implements Tran
         {
             try(LogFile txn = LogFile.make(entry.getKey(), entry.getValue()))
             {
+                logger.info("Verifying logfile transaction {}", txn);
                 if (txn.verify())
                 {
                     Throwable failure = txn.removeUnfinishedLeftovers(null);

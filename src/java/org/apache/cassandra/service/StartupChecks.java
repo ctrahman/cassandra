@@ -20,6 +20,8 @@ package org.apache.cassandra.service;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.lang.management.RuntimeMXBean;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.*;
@@ -27,11 +29,13 @@ import java.util.stream.Collectors;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
+import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import net.jpountz.lz4.LZ4Factory;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.schema.TableMetadata;
@@ -48,6 +52,7 @@ import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.NativeLibrary;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JavaUtils;
 import org.apache.cassandra.utils.SigarLibrary;
 
 /**
@@ -80,6 +85,7 @@ public class StartupChecks
     // always want the system keyspace check run last, as this actually loads the schema for that
     // keyspace. All other checks should not require any schema initialization.
     private final List<StartupCheck> DEFAULT_TESTS = ImmutableList.of(checkJemalloc,
+                                                                      checkLz4Native,
                                                                       checkValidLaunchDate,
                                                                       checkJMXPorts,
                                                                       checkJMXProperties,
@@ -134,6 +140,17 @@ public class StartupChecks
                 logger.info("jemalloc preload explicitly disabled");
             else
                 logger.info("jemalloc seems to be preloaded from {}", jemalloc);
+        }
+    };
+
+    public static final StartupCheck checkLz4Native = () -> {
+        try
+        {
+            LZ4Factory.nativeInstance(); // make sure native loads
+        }
+        catch (AssertionError | LinkageError e)
+        {
+            logger.warn("lz4-java was unable to load native libraries; this will lower the performance of lz4 (network/sstables/etc.): {}", Throwables.getRootCause(e).getMessage());
         }
     };
 
@@ -195,16 +212,53 @@ public class StartupChecks
                 logger.warn("32bit JVM detected.  It is recommended to run Cassandra on a 64bit JVM for better performance.");
 
             String javaVmName = System.getProperty("java.vm.name");
-            if (javaVmName.contains("OpenJDK"))
-            {
-                // There is essentially no QA done on OpenJDK builds, and
-                // clusters running OpenJDK have seen many heap and load issues.
-                logger.warn("OpenJDK is not recommended. Please upgrade to the newest Oracle Java release");
-            }
-            else if (!javaVmName.contains("HotSpot"))
+            if (!(javaVmName.contains("HotSpot") || javaVmName.contains("OpenJDK")))
             {
                 logger.warn("Non-Oracle JVM detected.  Some features, such as immediate unmap of compacted SSTables, may not work as intended");
             }
+            else
+            {
+                checkOutOfMemoryHandling();
+            }
+        }
+
+        /**
+         * Checks that the JVM is configured to handle OutOfMemoryError
+         */
+        private void checkOutOfMemoryHandling()
+        {
+            if (JavaUtils.supportExitOnOutOfMemory(System.getProperty("java.version")))
+            {
+                if (!jvmOptionsContainsOneOf("-XX:OnOutOfMemoryError=", "-XX:+ExitOnOutOfMemoryError", "-XX:+CrashOnOutOfMemoryError"))
+                    logger.warn("The JVM is not configured to stop on OutOfMemoryError which can cause data corruption."
+                                + " Use one of the following JVM options to configure the behavior on OutOfMemoryError: "
+                                + " -XX:+ExitOnOutOfMemoryError, -XX:+CrashOnOutOfMemoryError, or -XX:OnOutOfMemoryError=\"<cmd args>;<cmd args>\"");
+            }
+            else
+            {
+                if (!jvmOptionsContainsOneOf("-XX:OnOutOfMemoryError="))
+                    logger.warn("The JVM is not configured to stop on OutOfMemoryError which can cause data corruption."
+                            + " Either upgrade your JRE to a version greater or equal to 8u92 and use -XX:+ExitOnOutOfMemoryError/-XX:+CrashOnOutOfMemoryError"
+                            + " or use -XX:OnOutOfMemoryError=\"<cmd args>;<cmd args>\" on your current JRE.");
+            }
+        }
+
+        /**
+         * Checks if one of the specified options is being used.
+         * @param optionNames The name of the options to check
+         * @return {@code true} if one of the specified options is being used, {@code false} otherwise.
+         */
+        private boolean jvmOptionsContainsOneOf(String... optionNames)
+        {
+            RuntimeMXBean runtimeMxBean = ManagementFactory.getRuntimeMXBean();
+            List<String> inputArguments = runtimeMxBean.getInputArguments();
+            for (String argument : inputArguments)
+            {
+                for (String optionName : optionNames)
+                    if (argument.startsWith(optionName))
+                        return true;
+            }
+            return false;
         }
     };
 
@@ -397,7 +451,7 @@ public class StartupChecks
                 String storedDc = SystemKeyspace.getDatacenter();
                 if (storedDc != null)
                 {
-                    String currentDc = DatabaseDescriptor.getEndpointSnitch().getDatacenter(FBUtilities.getBroadcastAddress());
+                    String currentDc = DatabaseDescriptor.getEndpointSnitch().getLocalDatacenter();
                     if (!storedDc.equals(currentDc))
                     {
                         String formatMessage = "Cannot start node if snitch's data center (%s) differs from previous data center (%s). " +
@@ -419,7 +473,7 @@ public class StartupChecks
                 String storedRack = SystemKeyspace.getRack();
                 if (storedRack != null)
                 {
-                    String currentRack = DatabaseDescriptor.getEndpointSnitch().getRack(FBUtilities.getBroadcastAddress());
+                    String currentRack = DatabaseDescriptor.getEndpointSnitch().getLocalRack();
                     if (!storedRack.equals(currentRack))
                     {
                         String formatMessage = "Cannot start node if snitch's rack (%s) differs from previous rack (%s). " +

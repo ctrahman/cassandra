@@ -21,6 +21,7 @@
 package org.apache.cassandra.db.lifecycle;
 
 import java.io.File;
+import java.io.FilenameFilter;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
@@ -29,7 +30,9 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.zip.CRC32;
 
+import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -148,13 +151,38 @@ final class LogRecord
 
     public static LogRecord make(Type type, SSTable table)
     {
-        String absoluteTablePath = FileUtils.getCanonicalPath(table.descriptor.baseFilename());
+        String absoluteTablePath = absolutePath(table.descriptor.baseFilename());
         return make(type, getExistingFiles(absoluteTablePath), table.getAllFilePaths().size(), absoluteTablePath);
     }
 
-    public LogRecord withExistingFiles()
+    public static Map<SSTable, LogRecord> make(Type type, Iterable<SSTableReader> tables)
     {
-        return make(type, getExistingFiles(), 0, absolutePath.get());
+        // contains a mapping from sstable absolute path (everything up until the 'Data'/'Index'/etc part of the filename) to the sstable
+        Map<String, SSTable> absolutePaths = new HashMap<>();
+        for (SSTableReader table : tables)
+            absolutePaths.put(absolutePath(table.descriptor.baseFilename()), table);
+
+        // maps sstable base file name to the actual files on disk
+        Map<String, List<File>> existingFiles = getExistingFiles(absolutePaths.keySet());
+        Map<SSTable, LogRecord> records = new HashMap<>(existingFiles.size());
+        for (Map.Entry<String, List<File>> entry : existingFiles.entrySet())
+        {
+            List<File> filesOnDisk = entry.getValue();
+            String baseFileName = entry.getKey();
+            SSTable sstable = absolutePaths.get(baseFileName);
+            records.put(sstable, make(type, filesOnDisk, sstable.getAllFilePaths().size(), baseFileName));
+        }
+        return records;
+    }
+
+    private static String absolutePath(String baseFilename)
+    {
+        return FileUtils.getCanonicalPath(baseFilename + Component.separator);
+    }
+
+    public LogRecord withExistingFiles(List<File> existingFiles)
+    {
+        return make(type, existingFiles, 0, absolutePath.get());
     }
 
     public static LogRecord make(Type type, List<File> files, int minFiles, String absolutePath)
@@ -253,12 +281,6 @@ final class LogRecord
                              checksum);
     }
 
-    public List<File> getExistingFiles()
-    {
-        assert absolutePath.isPresent() : "Expected a path in order to get existing files";
-        return getExistingFiles(absolutePath.get());
-    }
-
     public static List<File> getExistingFiles(String absoluteFilePath)
     {
         Path path = Paths.get(absoluteFilePath);
@@ -266,6 +288,48 @@ final class LogRecord
         // files may be null if the directory does not exist yet, e.g. when tracking new files
         return files == null ? Collections.emptyList() : Arrays.asList(files);
     }
+
+    /**
+     * absoluteFilePaths contains full file parts up to (but excluding) the component name
+     *
+     * This method finds all files on disk beginning with any of the paths in absoluteFilePaths
+     *
+     * @return a map from absoluteFilePath to actual file on disk.
+     */
+    public static Map<String, List<File>> getExistingFiles(Set<String> absoluteFilePaths)
+    {
+        Map<String, List<File>> fileMap = new HashMap<>();
+        Map<File, TreeSet<String>> dirToFileNamePrefix = new HashMap<>();
+        for (String absolutePath : absoluteFilePaths)
+        {
+            Path fullPath = Paths.get(absolutePath);
+            Path path = fullPath.getParent();
+            if (path != null)
+                dirToFileNamePrefix.computeIfAbsent(path.toFile(), (k) -> new TreeSet<>()).add(fullPath.getFileName().toString());
+        }
+
+        FilenameFilter ff = (dir, name) -> {
+            TreeSet<String> dirSet = dirToFileNamePrefix.get(dir);
+            // if the set contains a prefix of the current file name, the file name we have here should sort directly
+            // after the prefix in the tree set, which means we can use 'floor' to get the prefix (returns the largest
+            // of the smaller strings in the set). Also note that the prefixes always end with '-' which means we won't
+            // have "xy-1111-Data.db".startsWith("xy-11") below (we'd get "xy-1111-Data.db".startsWith("xy-11-"))
+            String baseName = dirSet.floor(name);
+            if (baseName != null && name.startsWith(baseName))
+            {
+                String absolutePath = new File(dir, baseName).getPath();
+                fileMap.computeIfAbsent(absolutePath, k -> new ArrayList<>()).add(new File(dir, name));
+            }
+            return false;
+        };
+
+        // populate the file map:
+        for (File f : dirToFileNamePrefix.keySet())
+            f.listFiles(ff);
+
+        return fileMap;
+    }
+
 
     public boolean isFinal()
     {
@@ -327,5 +391,10 @@ final class LogRecord
         FBUtilities.updateChecksumInt(crc32, (int) (updateTime >>> 32));
         FBUtilities.updateChecksumInt(crc32, numFiles);
         return crc32.getValue() & (Long.MAX_VALUE);
+    }
+
+    LogRecord asType(Type type)
+    {
+        return new LogRecord(type, absolutePath.orElse(null), updateTime, numFiles);
     }
 }

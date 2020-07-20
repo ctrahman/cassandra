@@ -38,6 +38,12 @@ import org.apache.cassandra.stress.util.JavaDriverClient;
 
 public abstract class SchemaStatement extends PartitionOperation
 {
+    public enum ArgSelect
+    {
+        MULTIROW, SAMEROW;
+        //TODO: FIRSTROW, LASTROW
+    }
+
     final PreparedStatement statement;
     final ConsistencyLevel cl;
     final int[] argumentIndex;
@@ -58,7 +64,12 @@ public abstract class SchemaStatement extends PartitionOperation
             argumentIndex[i++] = spec.partitionGenerator.indexOf(name);
 
         if (statement != null)
-            statement.setConsistencyLevel(JavaDriverClient.from(cl));
+        {
+            if (cl.isSerialConsistency())
+                statement.setSerialConsistencyLevel(JavaDriverClient.from(cl));
+            else
+                statement.setConsistencyLevel(JavaDriverClient.from(cl));
+        }
     }
 
     BoundStatement bindRow(Row row)

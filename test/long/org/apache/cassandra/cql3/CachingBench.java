@@ -33,7 +33,7 @@ import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import junit.framework.Assert;
+import org.junit.Assert;
 import org.apache.cassandra.config.Config.CommitLogSync;
 import org.apache.cassandra.config.Config.DiskAccessMode;
 import org.apache.cassandra.cache.ChunkCache;
@@ -340,8 +340,9 @@ public class CachingBench extends CQLTester
 
     int countRows(ColumnFamilyStore cfs)
     {
+        boolean enforceStrictLiveness = cfs.metadata().enforceStrictLiveness();
         int nowInSec = FBUtilities.nowInSeconds();
-        return count(cfs, x -> x.isRow() && ((Row) x).hasLiveData(nowInSec));
+        return count(cfs, x -> x.isRow() && ((Row) x).hasLiveData(nowInSec, enforceStrictLiveness));
     }
 
     private int count(ColumnFamilyStore cfs, Predicate<Unfiltered> predicate)
